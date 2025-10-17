@@ -49,3 +49,7 @@ export class Router {
 }
 
 export const router = new Router();
+
+export function navigateTo(path) {
+  router.navigate(path);
+}

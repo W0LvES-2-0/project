@@ -1,10 +1,18 @@
 /*
-  # IoT Dashboard Complete Schema with Custom Fields
+  # IoT Dashboard Complete Schema with Custom Fields and Authentication
 
   ## Overview
-  Creates a comprehensive IoT dashboard schema supporting custom project fields, devices, telemetry data, firmware, and ML models.
+  Creates a comprehensive IoT dashboard schema supporting user authentication, custom project fields,
+  devices with API keys, telemetry data, firmware, and ML models.
 
   ## 1. New Tables
+
+  ### user_profiles
+  - `user_id` (uuid, primary key, foreign key to auth.users) - Links to Supabase auth
+  - `email` (text) - User email
+  - `display_name` (text) - User display name
+  - `created_at` (timestamptz) - Account creation timestamp
+  - `updated_at` (timestamptz) - Last update timestamp
 
   ### projects
   - `project_id` (varchar, primary key) - Unique project identifier (e.g., WP01)
@@ -12,14 +20,19 @@
   - `project_type` (text) - Type: 'water_pump' or 'smart_light'
   - `ml_enabled` (boolean) - ML script option enabled
   - `custom_fields` (jsonb) - Dynamic field definitions for project-specific data
+  - `user_id` (uuid, foreign key) - Owner of the project
   - `created_at` (timestamptz) - Auto-generated creation timestamp
-  
+
   ### devices
   - `device_id` (varchar, primary key) - Unique device identifier
   - `project_id` (varchar, foreign key) - Links to projects table
+  - `api_key` (uuid, unique) - Unique API key for device authentication
+  - `user_id` (uuid, foreign key) - Owner of the device
   - `role` (text) - Device role: 'regular' or 'beta'
   - `auto_update` (boolean) - Enable automatic firmware updates
   - `custom_data` (jsonb) - Values for custom fields defined in project
+  - `is_registered` (boolean) - Device registration status
+  - `first_connected_at` (timestamptz) - First connection timestamp
   - `updated_at` (timestamptz) - Last update timestamp
   
   ### wp_samples (Water Pump Telemetry)
@@ -68,31 +81,46 @@
 
   ## 3. Security
   - Enable RLS on all tables
-  - Public access policies for all CRUD operations (suitable for IoT devices)
-  - Policies handle JSONB columns for custom fields
+  - User-based access control for projects and devices
+  - Device API key authentication for telemetry uploads
+  - Public read access for authenticated users, write access for owners only
 
   ## 4. Performance
   - Indexes on foreign keys and timestamp columns
   - GIN indexes on JSONB columns for efficient querying
 */
 
+-- Create user_profiles table
+CREATE TABLE IF NOT EXISTS user_profiles (
+  user_id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  email TEXT NOT NULL,
+  display_name TEXT,
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now()
+);
+
 -- Create projects table
-CREATE TABLE projects (
+CREATE TABLE IF NOT EXISTS projects (
   project_id VARCHAR(64) PRIMARY KEY,
   project_name TEXT NOT NULL,
-  project_type TEXT NOT NULL CHECK (project_type IN ('water_pump', 'smart_light')),
+  project_type TEXT NOT NULL,
   ml_enabled BOOLEAN DEFAULT false,
   custom_fields JSONB DEFAULT '[]'::jsonb,
+  user_id UUID REFERENCES user_profiles(user_id) ON DELETE CASCADE,
   created_at TIMESTAMPTZ DEFAULT now()
 );
 
 -- Create devices table
-CREATE TABLE devices (
+CREATE TABLE IF NOT EXISTS devices (
   device_id VARCHAR(64) PRIMARY KEY,
   project_id VARCHAR(64) NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+  api_key UUID UNIQUE DEFAULT gen_random_uuid(),
+  user_id UUID REFERENCES user_profiles(user_id) ON DELETE CASCADE,
   role TEXT DEFAULT 'regular' CHECK (role IN ('regular', 'beta')),
   auto_update BOOLEAN DEFAULT false,
   custom_data JSONB DEFAULT '{}'::jsonb,
+  is_registered BOOLEAN DEFAULT false,
+  first_connected_at TIMESTAMPTZ,
   updated_at TIMESTAMPTZ DEFAULT now()
 );
 
@@ -144,19 +172,24 @@ CREATE TABLE ml_models (
 );
 
 -- Create indexes for performance
-CREATE INDEX idx_devices_project ON devices(project_id);
-CREATE INDEX idx_wp_samples_project ON wp_samples(project_id);
-CREATE INDEX idx_wp_samples_device ON wp_samples(device_id);
-CREATE INDEX idx_wp_samples_ts ON wp_samples(ts_utc DESC);
-CREATE INDEX idx_sl_samples_project ON sl_samples(project_id);
-CREATE INDEX idx_sl_samples_device ON sl_samples(device_id);
-CREATE INDEX idx_sl_samples_ts ON sl_samples(ts_utc DESC);
-CREATE INDEX idx_firmware_version ON firmware(version);
-CREATE INDEX idx_ml_models_project ON ml_models(project_id);
-CREATE INDEX idx_projects_custom_fields ON projects USING gin(custom_fields);
-CREATE INDEX idx_devices_custom_data ON devices USING gin(custom_data);
+CREATE INDEX IF NOT EXISTS idx_user_profiles_email ON user_profiles(email);
+CREATE INDEX IF NOT EXISTS idx_projects_user ON projects(user_id);
+CREATE INDEX IF NOT EXISTS idx_devices_project ON devices(project_id);
+CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id);
+CREATE INDEX IF NOT EXISTS idx_devices_api_key ON devices(api_key);
+CREATE INDEX IF NOT EXISTS idx_wp_samples_project ON wp_samples(project_id);
+CREATE INDEX IF NOT EXISTS idx_wp_samples_device ON wp_samples(device_id);
+CREATE INDEX IF NOT EXISTS idx_wp_samples_ts ON wp_samples(ts_utc DESC);
+CREATE INDEX IF NOT EXISTS idx_sl_samples_project ON sl_samples(project_id);
+CREATE INDEX IF NOT EXISTS idx_sl_samples_device ON sl_samples(device_id);
+CREATE INDEX IF NOT EXISTS idx_sl_samples_ts ON sl_samples(ts_utc DESC);
+CREATE INDEX IF NOT EXISTS idx_firmware_version ON firmware(version);
+CREATE INDEX IF NOT EXISTS idx_ml_models_project ON ml_models(project_id);
+CREATE INDEX IF NOT EXISTS idx_projects_custom_fields ON projects USING gin(custom_fields);
+CREATE INDEX IF NOT EXISTS idx_devices_custom_data ON devices USING gin(custom_data);
 
 -- Enable Row Level Security
+ALTER TABLE user_profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE projects ENABLE ROW LEVEL SECURITY;
 ALTER TABLE devices ENABLE ROW LEVEL SECURITY;
 ALTER TABLE wp_samples ENABLE ROW LEVEL SECURITY;
@@ -164,245 +197,191 @@ ALTER TABLE sl_samples ENABLE ROW LEVEL SECURITY;
 ALTER TABLE firmware ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ml_models ENABLE ROW LEVEL SECURITY;
 
+-- RLS Policies for user_profiles
+CREATE POLICY "Users can view own profile"
+  ON user_profiles FOR SELECT
+  TO authenticated
+  USING (auth.uid() = user_id);
+
+CREATE POLICY "Users can insert own profile"
+  ON user_profiles FOR INSERT
+  TO authenticated
+  WITH CHECK (auth.uid() = user_id);
+
+CREATE POLICY "Users can update own profile"
+  ON user_profiles FOR UPDATE
+  TO authenticated
+  USING (auth.uid() = user_id)
+  WITH CHECK (auth.uid() = user_id);
+
 -- RLS Policies for projects
-CREATE POLICY "Allow public read access to projects"
+CREATE POLICY "Users can view own projects"
   ON projects FOR SELECT
-  TO anon, authenticated
-  USING (true);
+  TO authenticated
+  USING (auth.uid() = user_id);
 
-CREATE POLICY "Allow public insert to projects"
+CREATE POLICY "Users can insert own projects"
   ON projects FOR INSERT
-  TO anon, authenticated
-  WITH CHECK (true);
+  TO authenticated
+  WITH CHECK (auth.uid() = user_id);
 
-CREATE POLICY "Allow public update to projects"
+CREATE POLICY "Users can update own projects"
   ON projects FOR UPDATE
-  TO anon, authenticated
-  USING (true)
-  WITH CHECK (true);
+  TO authenticated
+  USING (auth.uid() = user_id)
+  WITH CHECK (auth.uid() = user_id);
 
-CREATE POLICY "Allow public delete to projects"
+CREATE POLICY "Users can delete own projects"
   ON projects FOR DELETE
-  TO anon, authenticated
-  USING (true);
+  TO authenticated
+  USING (auth.uid() = user_id);
 
 -- RLS Policies for devices
-CREATE POLICY "Allow public read access to devices"
+CREATE POLICY "Users can view own devices"
   ON devices FOR SELECT
-  TO anon, authenticated
-  USING (true);
+  TO authenticated
+  USING (auth.uid() = user_id);
 
-CREATE POLICY "Allow public insert to devices"
+CREATE POLICY "Users can insert own devices"
   ON devices FOR INSERT
-  TO anon, authenticated
-  WITH CHECK (true);
+  TO authenticated
+  WITH CHECK (auth.uid() = user_id);
 
-CREATE POLICY "Allow public update to devices"
+CREATE POLICY "Users can update own devices"
   ON devices FOR UPDATE
-  TO anon, authenticated
-  USING (true)
-  WITH CHECK (true);
+  TO authenticated
+  USING (auth.uid() = user_id)
+  WITH CHECK (auth.uid() = user_id);
 
-CREATE POLICY "Allow public delete to devices"
+CREATE POLICY "Users can delete own devices"
   ON devices FOR DELETE
-  TO anon, authenticated
+  TO authenticated
+  USING (auth.uid() = user_id);
+
+CREATE POLICY "Devices can authenticate with API key"
+  ON devices FOR SELECT
+  TO anon
   USING (true);
 
 -- RLS Policies for wp_samples
-CREATE POLICY "Allow public read access to wp_samples"
+CREATE POLICY "Users can view own project samples"
   ON wp_samples FOR SELECT
-  TO anon, authenticated
-  USING (true);
+  TO authenticated
+  USING (
+    EXISTS (
+      SELECT 1 FROM projects
+      WHERE projects.project_id = wp_samples.project_id
+      AND projects.user_id = auth.uid()
+    )
+  );
 
-CREATE POLICY "Allow public insert to wp_samples"
+CREATE POLICY "Devices can insert samples via API"
   ON wp_samples FOR INSERT
   TO anon, authenticated
   WITH CHECK (true);
 
-CREATE POLICY "Allow public delete to wp_samples"
+CREATE POLICY "Users can delete own project samples"
   ON wp_samples FOR DELETE
-  TO anon, authenticated
-  USING (true);
+  TO authenticated
+  USING (
+    EXISTS (
+      SELECT 1 FROM projects
+      WHERE projects.project_id = wp_samples.project_id
+      AND projects.user_id = auth.uid()
+    )
+  );
 
 -- RLS Policies for sl_samples
-CREATE POLICY "Allow public read access to sl_samples"
+CREATE POLICY "Users can view own project light samples"
   ON sl_samples FOR SELECT
-  TO anon, authenticated
-  USING (true);
+  TO authenticated
+  USING (
+    EXISTS (
+      SELECT 1 FROM projects
+      WHERE projects.project_id = sl_samples.project_id
+      AND projects.user_id = auth.uid()
+    )
+  );
 
-CREATE POLICY "Allow public insert to sl_samples"
+CREATE POLICY "Devices can insert light samples via API"
   ON sl_samples FOR INSERT
   TO anon, authenticated
   WITH CHECK (true);
 
-CREATE POLICY "Allow public delete to sl_samples"
+CREATE POLICY "Users can delete own project light samples"
   ON sl_samples FOR DELETE
-  TO anon, authenticated
-  USING (true);
+  TO authenticated
+  USING (
+    EXISTS (
+      SELECT 1 FROM projects
+      WHERE projects.project_id = sl_samples.project_id
+      AND projects.user_id = auth.uid()
+    )
+  );
 
 -- RLS Policies for firmware
-CREATE POLICY "Allow public read access to firmware"
+CREATE POLICY "All authenticated users can view firmware"
   ON firmware FOR SELECT
-  TO anon, authenticated
+  TO authenticated
   USING (true);
 
-CREATE POLICY "Allow public insert to firmware"
+CREATE POLICY "Devices can download firmware"
+  ON firmware FOR SELECT
+  TO anon
+  USING (true);
+
+CREATE POLICY "Authenticated users can upload firmware"
   ON firmware FOR INSERT
-  TO anon, authenticated
+  TO authenticated
   WITH CHECK (true);
 
-CREATE POLICY "Allow public delete to firmware"
+CREATE POLICY "Authenticated users can delete firmware"
   ON firmware FOR DELETE
-  TO anon, authenticated
+  TO authenticated
   USING (true);
 
 -- RLS Policies for ml_models
-CREATE POLICY "Allow public read access to ml_models"
+CREATE POLICY "Users can view own project models"
   ON ml_models FOR SELECT
-  TO anon, authenticated
+  TO authenticated
+  USING (
+    EXISTS (
+      SELECT 1 FROM projects
+      WHERE projects.project_id = ml_models.project_id
+      AND projects.user_id = auth.uid()
+    )
+  );
+
+CREATE POLICY "Devices can download models"
+  ON ml_models FOR SELECT
+  TO anon
   USING (true);
 
-CREATE POLICY "Allow public insert to ml_models"
+CREATE POLICY "Users can insert own project models"
   ON ml_models FOR INSERT
-  TO anon, authenticated
-  WITH CHECK (true);
+  TO authenticated
+  WITH CHECK (
+    EXISTS (
+      SELECT 1 FROM projects
+      WHERE projects.project_id = ml_models.project_id
+      AND projects.user_id = auth.uid()
+    )
+  );
 
-CREATE POLICY "Allow public delete to ml_models"
+CREATE POLICY "Users can delete own project models"
   ON ml_models FOR DELETE
-  TO anon, authenticated
-  USING (true);
-
--- Insert projects with custom fields
-INSERT INTO projects (project_id, project_name, project_type, ml_enabled, custom_fields, created_at)
-VALUES 
-  (
-    'WP01', 
-    'Water Tank System', 
-    'water_pump', 
-    true,
-    '[
-      {"name": "tank_shape", "type": "select", "label": "Tank Shape", "required": true, "options": ["rectangular", "cylindrical", "spherical"]},
-      {"name": "height_cm", "type": "number", "label": "Height (cm)", "required": true},
-      {"name": "width_cm", "type": "number", "label": "Width (cm)", "required": false},
-      {"name": "length_cm", "type": "number", "label": "Length (cm)", "required": false},
-      {"name": "radius_cm", "type": "number", "label": "Radius (cm)", "required": false},
-      {"name": "material", "type": "text", "label": "Tank Material", "required": false},
-      {"name": "capacity_liters", "type": "number", "label": "Capacity (L)", "required": false}
-    ]'::jsonb,
-    now() - interval '30 days'
-  ),
-  (
-    'SL01', 
-    'Smart Light System', 
-    'smart_light', 
-    false,
-    '[
-      {"name": "max_brightness", "type": "number", "label": "Max Brightness (%)", "required": true},
-      {"name": "color_support", "type": "checkbox", "label": "Color Support", "required": true},
-      {"name": "location", "type": "text", "label": "Location", "required": false},
-      {"name": "wattage", "type": "number", "label": "Wattage (W)", "required": false}
-    ]'::jsonb,
-    now() - interval '20 days'
+  TO authenticated
+  USING (
+    EXISTS (
+      SELECT 1 FROM projects
+      WHERE projects.project_id = ml_models.project_id
+      AND projects.user_id = auth.uid()
+    )
   );
 
--- Insert devices for Water Tank System
-INSERT INTO devices (device_id, project_id, role, auto_update, custom_data, updated_at)
-VALUES 
-  (
-    'DEV-WP01-001', 
-    'WP01', 
-    'regular', 
-    true,
-    '{"tank_shape": "rectangular", "height_cm": 200, "width_cm": 150, "length_cm": 150, "material": "stainless steel", "capacity_liters": 4500}'::jsonb,
-    now() - interval '5 days'
-  ),
-  (
-    'DEV-WP01-002', 
-    'WP01', 
-    'beta', 
-    true,
-    '{"tank_shape": "cylindrical", "height_cm": 250, "radius_cm": 80, "material": "plastic", "capacity_liters": 5000}'::jsonb,
-    now() - interval '3 days'
-  ),
-  (
-    'DEV-WP01-003', 
-    'WP01', 
-    'regular', 
-    false,
-    '{"tank_shape": "rectangular", "height_cm": 180, "width_cm": 120, "length_cm": 120, "material": "concrete", "capacity_liters": 2600}'::jsonb,
-    now() - interval '7 days'
-  ),
-  (
-    'DEV-WP01-004', 
-    'WP01', 
-    'regular', 
-    true,
-    '{"tank_shape": "cylindrical", "height_cm": 300, "radius_cm": 100, "material": "fiberglass", "capacity_liters": 9400}'::jsonb,
-    now() - interval '2 days'
-  );
+-- Note: Sample data removed - users must create their own projects and devices after signup
 
--- Insert devices for Smart Light System
-INSERT INTO devices (device_id, project_id, role, auto_update, custom_data, updated_at)
-VALUES 
-  (
-    'DEV-SL01-001', 
-    'SL01', 
-    'regular', 
-    true,
-    '{"max_brightness": 100, "color_support": true, "location": "Living Room", "wattage": 12}'::jsonb,
-    now() - interval '4 days'
-  ),
-  (
-    'DEV-SL01-002', 
-    'SL01', 
-    'beta', 
-    true,
-    '{"max_brightness": 80, "color_support": false, "location": "Kitchen", "wattage": 9}'::jsonb,
-    now() - interval '6 days'
-  ),
-  (
-    'DEV-SL01-003', 
-    'SL01', 
-    'regular', 
-    false,
-    '{"max_brightness": 100, "color_support": true, "location": "Bedroom", "wattage": 15}'::jsonb,
-    now() - interval '1 day'
-  );
-
--- Insert Water Pump telemetry data (120 samples per device over 5 days)
-INSERT INTO wp_samples (project_id, device_id, ts_utc, level_pct, pump_on, flow_out_lpm, flow_in_lpm, net_flow_lpm)
-SELECT 
-  'WP01',
-  device_id,
-  now() - (interval '1 hour' * generate_series(0, 119)),
-  ROUND((45 + (random() * 50))::numeric, 2),
-  (random() > 0.6)::boolean,
-  ROUND((random() * 15)::numeric, 2),
-  ROUND((random() * 20)::numeric, 2),
-  ROUND(((random() * 20) - (random() * 15))::numeric, 2)
-FROM (
-  SELECT 'DEV-WP01-001' as device_id UNION ALL
-  SELECT 'DEV-WP01-002' UNION ALL
-  SELECT 'DEV-WP01-003' UNION ALL
-  SELECT 'DEV-WP01-004'
-) devices;
-
--- Insert Smart Light telemetry data (120 samples per device over 5 days)
-INSERT INTO sl_samples (project_id, device_id, ts_utc, brightness, power_w, color_temp)
-SELECT 
-  'SL01',
-  device_id,
-  now() - (interval '1 hour' * generate_series(0, 119)),
-  (30 + random() * 70)::integer,
-  ROUND((5 + random() * 15)::numeric, 2),
-  (2700 + (random() * 3800)::integer)
-FROM (
-  SELECT 'DEV-SL01-001' as device_id UNION ALL
-  SELECT 'DEV-SL01-002' UNION ALL
-  SELECT 'DEV-SL01-003'
-) devices;
-
-ALTER TABLE projects DROP CONSTRAINT IF EXISTS projects_project_type_check;
+-- Commented out sample data (requires user_id)
 
 -- Create realtime_data table
 CREATE TABLE IF NOT EXISTS realtime_data (
@@ -434,26 +413,38 @@ CREATE INDEX IF NOT EXISTS idx_projects_realtime_fields ON projects USING gin(re
 ALTER TABLE realtime_data ENABLE ROW LEVEL SECURITY;
 
 -- RLS Policies for realtime_data
-CREATE POLICY "Allow public read access to realtime_data"
+CREATE POLICY "Users can view own device realtime data"
   ON realtime_data FOR SELECT
-  TO anon, authenticated
-  USING (true);
+  TO authenticated
+  USING (
+    EXISTS (
+      SELECT 1 FROM devices
+      WHERE devices.device_id = realtime_data.device_id
+      AND devices.user_id = auth.uid()
+    )
+  );
 
-CREATE POLICY "Allow public insert to realtime_data"
+CREATE POLICY "Devices can insert realtime data via API"
   ON realtime_data FOR INSERT
   TO anon, authenticated
   WITH CHECK (true);
 
-CREATE POLICY "Allow public update to realtime_data"
+CREATE POLICY "Devices can update realtime data via API"
   ON realtime_data FOR UPDATE
   TO anon, authenticated
   USING (true)
   WITH CHECK (true);
 
-CREATE POLICY "Allow public delete to realtime_data"
+CREATE POLICY "Users can delete own device realtime data"
   ON realtime_data FOR DELETE
-  TO anon, authenticated
-  USING (true);
+  TO authenticated
+  USING (
+    EXISTS (
+      SELECT 1 FROM devices
+      WHERE devices.device_id = realtime_data.device_id
+      AND devices.user_id = auth.uid()
+    )
+  );
 
 DO $$
 BEGIN
