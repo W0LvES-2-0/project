@@ -3,6 +3,8 @@ import { supabase } from '../lib/supabase.js';
 export async function renderHome() {
   const app = document.getElementById('app');
 
+  const { data: { user } } = await supabase.auth.getUser();
+  const { data: profile } = await supabase.from('user_profiles').select('*').eq('user_id', user?.id).maybeSingle();
   const { data: projects } = await supabase.from('projects').select('*');
   const { data: devices } = await supabase.from('devices').select('*');
   const { data: firmware } = await supabase.from('firmware').select('*').order('uploaded_at', { ascending: false }).limit(1);
@@ -13,10 +15,15 @@ export async function renderHome() {
         <a href="/" class="navbar-brand">IoT Dashboard</a>
         <ul class="navbar-nav">
           <li><a href="/" class="nav-link active">Home</a></li>
-          <li><a href="/firmware" class="nav-link">Firmware</a></li>
+          ${profile?.role === 'admin' ? '<li><a href="/firmware" class="nav-link">Firmware</a></li>' : ''}
           <li><a href="/devices" class="nav-link">Devices</a></li>
-          <li><a href="/projects" class="nav-link">Projects</a></li>
+          ${profile?.role === 'admin' ? '<li><a href="/projects" class="nav-link">Projects</a></li>' : ''}
         </ul>
+        <div class="navbar-user">
+          <span class="user-name">${profile?.display_name || user?.email}</span>
+          <span class="user-role">${profile?.role || 'user'}</span>
+          <button id="logoutBtn" class="btn btn-secondary">Logout</button>
+        </div>
       </div>
     </div>
 
@@ -68,6 +75,13 @@ export async function renderHome() {
       ` : ''}
     </div>
   `;
+
+  const logoutBtn = document.getElementById('logoutBtn');
+  if (logoutBtn) {
+    logoutBtn.addEventListener('click', async () => {
+      await supabase.auth.signOut();
+    });
+  }
 
   updateActiveNav('home');
 }
